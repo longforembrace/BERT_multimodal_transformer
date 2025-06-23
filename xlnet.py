@@ -5,8 +5,8 @@ from torch.nn import CrossEntropyLoss, MSELoss
 
 from global_configs import *
 from modeling import MAG
-from transformers.modeling_xlnet import XLNetPreTrainedModel
-from transformers.modeling_xlnet import (
+from transformers.models.xlnet.modeling_xlnet import XLNetPreTrainedModel
+from transformers.models.xlnet.modeling_xlnet import (
     XLNetLayer,
     SequenceSummary,
 )

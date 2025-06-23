@@ -8,6 +8,7 @@ import pickle
 import sys
 import numpy as np
 from typing import *
+import datetime
 
 from sklearn.metrics import classification_report
 from sklearn.metrics import confusion_matrix
@@ -26,7 +27,7 @@ from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import matthews_corrcoef
 from transformers import BertTokenizer, XLNetTokenizer, get_linear_schedule_with_warmup
 from transformers.optimization import AdamW
-from bert import MAG_BertForSequenceClassification
+from bert import MAG_BertForSequenceClassification, Concat_BertForSequenceClassification
 from xlnet import MAG_XLNetForSequenceClassification
 
 from argparse_utils import str2bool, seed
@@ -52,6 +53,8 @@ parser.add_argument("--learning_rate", type=float, default=1e-5)
 parser.add_argument("--gradient_accumulation_step", type=int, default=1)
 parser.add_argument("--warmup_proportion", type=float, default=0.1)
 parser.add_argument("--seed", type=seed, default="random")
+parser.add_argument("--fusion", type=str, choices=["mag", "concat"], 
+                    default="mag", help="Fusion method")
 
 
 args = parser.parse_args()
@@ -82,11 +85,13 @@ class MultimodalConfig(object):
 def convert_to_features(examples, max_seq_length, tokenizer):
     features = []
 
+    # 接收每个样本，包含[文本，视觉特征，音频特征]，标签id和段落信息
     for (ex_index, example) in enumerate(examples):
 
         (words, visual, acoustic), label_id, segment = example
 
         tokens, inversions = [], []
+        # 将每个单词分词，并记录其在原始句子中的位置
         for idx, word in enumerate(words):
             tokenized = tokenizer.tokenize(word)
             tokens.extend(tokenized)
@@ -98,6 +103,8 @@ def convert_to_features(examples, max_seq_length, tokenizer):
         aligned_visual = []
         aligned_audio = []
 
+        # 将视觉和音频特征与分词后的tokens对齐，若有一个长词被分为多个子词，
+        # 相应的视觉/音频特征会为每个子词复制
         for inv_idx in inversions:
             aligned_visual.append(visual[inv_idx, :])
             aligned_audio.append(acoustic[inv_idx, :])
@@ -105,7 +112,7 @@ def convert_to_features(examples, max_seq_length, tokenizer):
         visual = np.array(aligned_visual)
         acoustic = np.array(aligned_audio)
 
-        # Truncate input if necessary
+        # Truncate input if necessary 若序列长度大于最大长度-2（为特殊词符留下空间），则截断三模态序列
         if len(tokens) > max_seq_length - 2:
             tokens = tokens[: max_seq_length - 2]
             acoustic = acoustic[: max_seq_length - 2]
@@ -151,9 +158,11 @@ def prepare_bert_input(tokens, visual, acoustic, tokenizer):
     visual_zero = np.zeros((1, VISUAL_DIM))
     visual = np.concatenate((visual_zero, visual, visual_zero))
 
-    input_ids = tokenizer.convert_tokens_to_ids(tokens)
-    segment_ids = [0] * len(input_ids)
-    input_mask = [1] * len(input_ids)
+    # 生成BERT输入组件，填充向量到最大长度，让每个输入序列长度为args.max_seq_length，
+    # 使得所有样本可以组成tensor，进行批处理
+    input_ids = tokenizer.convert_tokens_to_ids(tokens) # token转ID
+    segment_ids = [0] * len(input_ids)                  # 句子分段标识（全为0，代表单句）
+    input_mask = [1] * len(input_ids)                   # 注意力掩码（全为1，代表有效token）
 
     pad_length = args.max_seq_length - len(input_ids)
 
@@ -222,18 +231,14 @@ def get_appropriate_dataset(data):
 
     tokenizer = get_tokenizer(args.model)
 
-    features = convert_to_features(data, args.max_seq_length, tokenizer)
-    all_input_ids = torch.tensor(
-        [f.input_ids for f in features], dtype=torch.long)
-    all_input_mask = torch.tensor(
-        [f.input_mask for f in features], dtype=torch.long)
-    all_segment_ids = torch.tensor(
-        [f.segment_ids for f in features], dtype=torch.long)
-    all_visual = torch.tensor([f.visual for f in features], dtype=torch.float)
-    all_acoustic = torch.tensor(
-        [f.acoustic for f in features], dtype=torch.float)
-    all_label_ids = torch.tensor(
-        [f.label_id for f in features], dtype=torch.float)
+    features = convert_to_features(data, args.max_seq_length, tokenizer)    # 为每个数据划分进行特征转换
+
+    all_input_ids   = torch.tensor([f.input_ids for f in features], dtype=torch.long)   # 为每个token分配一个id，用于后续bert embedding层，将ID转化为向量，（1281,50）
+    all_input_mask  = torch.tensor([f.input_mask for f in features], dtype=torch.long)  # 注意力掩码，1代表有效token，0代表padding，（1281, 50）
+    all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long) # 句子分段标识，BERT模型需要知道每个token属于哪个句子，（1281,50）
+    all_visual      = torch.from_numpy(np.array([f.visual for f in features])).float()   # 视觉特征，形状为(1281, 50, 47)
+    all_acoustic    = torch.from_numpy(np.array([f.acoustic for f in features])).float()   # 声学特征，形状为(1281, 50, 74)
+    all_label_ids   = torch.from_numpy(np.array([f.label_id for f in features])).float()   # 情感强度标签ID，形状为(1281,)
 
     dataset = TensorDataset(
         all_input_ids,
@@ -246,6 +251,18 @@ def get_appropriate_dataset(data):
     return dataset
 
 
+''' 数据流向图
+输入数据：
+├── input_ids (文本token IDs) ──→ BERT Embedding ──→ 文本向量(768维)
+├── visual (视觉特征) ───────────────────────────→ 视觉向量(47维)  
+├── acoustic (声学特征) ─────────────────────────→ 声学向量(74维)
+                                    ↓
+                              MAG融合模块
+                                    ↓
+                            多模态融合向量(768维)
+                                    ↓
+                              分类/回归输出
+'''
 def set_up_data_loader():
     with open(f"datasets/{args.dataset}.pkl", "rb") as handle:
         data = pickle.load(handle)
@@ -254,17 +271,18 @@ def set_up_data_loader():
     dev_data = data["dev"]
     test_data = data["test"]
 
-    train_dataset = get_appropriate_dataset(train_data)
+    train_dataset = get_appropriate_dataset(train_data) # 选择分词器
     dev_dataset = get_appropriate_dataset(dev_data)
     test_dataset = get_appropriate_dataset(test_data)
 
+    # 整个训练过程中总的优化步数（参数更新次数），学习率调度器scheduler需要
     num_train_optimization_steps = (
         int(
             len(train_dataset) / args.train_batch_size /
             args.gradient_accumulation_step
         )
         * args.n_epochs
-    )
+    )       # 1040
 
     train_dataloader = DataLoader(
         train_dataset, batch_size=args.train_batch_size, shuffle=True
@@ -309,14 +327,29 @@ def set_random_seed(seed: int):
 
 
 def prep_for_training(num_train_optimization_steps: int):
+    # 多模态配置，MAG的\beta参数（控制多模态融合的强度）以及dropout概率
     multimodal_config = MultimodalConfig(
         beta_shift=args.beta_shift, dropout_prob=args.dropout_prob
     )
-
+    
+    '''
+        from_pretrained是继承自PreTrainedModel的类方法，会执行以下步骤：
+            步骤1：根据模型名称加载配置文件  config = BertConfig.from_pretrained("bert-base-uncased")
+                            从HuggingFace模型库下载BERT模型的预训练权重config.json
+            步骤2：用参数更新配置           config.num_labels = 1，表示回归任务（情感强度预测）
+            步骤3：创建模型实例             model = MAG_BertForSequenceClassification(config, multimodal_config)
+            步骤4：加载预训练权重           model.load_state_dict(torch.load("bert-base-uncased/pytorch_model.bin"))
+    '''
     if args.model == "bert-base-uncased":
-        model = MAG_BertForSequenceClassification.from_pretrained(
-            args.model, multimodal_config=multimodal_config, num_labels=1,
-        )
+        if args.fusion == "mag":      
+            model = MAG_BertForSequenceClassification.from_pretrained(
+                args.model, multimodal_config=multimodal_config, num_labels=1,
+            )
+        else:
+            model = Concat_BertForSequenceClassification.from_pretrained(
+                args.model, multimodal_config=multimodal_config, num_labels=1,
+            )
+            
     elif args.model == "xlnet-base-cased":
         model = MAG_XLNetForSequenceClassification.from_pretrained(
             args.model, multimodal_config=multimodal_config, num_labels=1
@@ -328,22 +361,22 @@ def prep_for_training(num_train_optimization_steps: int):
     param_optimizer = list(model.named_parameters())
     no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
-        {
+        {   # 普通权重参数，应用权重衰减（L2正则化）
             "params": [
                 p for n, p in param_optimizer if not any(nd in n for nd in no_decay)
             ],
-            "weight_decay": 0.01,
+            "weight_decay": 0.01,   # 权重衰减
         },
         {
             "params": [
                 p for n, p in param_optimizer if any(nd in n for nd in no_decay)
             ],
-            "weight_decay": 0.0,
+            "weight_decay": 0.0,    # 不对bias和LayerNorm应用权重衰减
         },
     ]
 
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
-    scheduler = get_linear_schedule_with_warmup(
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)      # 优化器
+    scheduler = get_linear_schedule_with_warmup(                                # 学习率调度器
         optimizer,
         num_warmup_steps=args.warmup_proportion * num_train_optimization_steps,
         num_training_steps=num_train_optimization_steps,
@@ -358,6 +391,8 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
     for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
         batch = tuple(t.to(DEVICE) for t in batch)
         input_ids, visual, acoustic, input_mask, segment_ids, label_ids = batch
+
+        # Dataloader
         visual = torch.squeeze(visual, 1)
         acoustic = torch.squeeze(acoustic, 1)
         outputs = model(
@@ -499,8 +534,8 @@ def train(
         )
 
         print(
-            "epoch:{}, train_loss:{}, valid_loss:{}, test_acc:{}".format(
-                epoch_i, train_loss, valid_loss, test_acc
+            "epoch:{}, train_loss:{}, valid_loss:{}, acc:{}, mae:{}, corr:{}, f1_score:{}".format(
+                epoch_i, train_loss, valid_loss, test_acc, test_mae, test_corr, test_f_score
             )
         )
 
@@ -524,8 +559,10 @@ def train(
 
 
 def main():
-    wandb.init(project="MAG")
-    wandb.config.update(args)
+    current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{current_time}_{args.fusion}_{args.dataset}"
+    wandb.init(project="MAG", name=run_name)
+    wandb.config.update(args)   # 将命令行参数添加到wandb配置中，使得实验配置更易被跟踪
     set_random_seed(args.seed)
 
     (
@@ -533,7 +570,7 @@ def main():
         dev_data_loader,
         test_data_loader,
         num_train_optimization_steps,
-    ) = set_up_data_loader()
+    ) = set_up_data_loader()    # 设置数据集和数据加载器
 
     model, optimizer, scheduler = prep_for_training(
         num_train_optimization_steps)
